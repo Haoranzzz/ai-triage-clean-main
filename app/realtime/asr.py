@@ -144,9 +144,11 @@ class StreamingASR:
         self._completion_check_count = 0
         
         silence_count = 0
-        max_silence_chunks = 12  # 增加到12 * 0.8s = 9.6s 静音后自动停止
+        max_silence_chunks = 15  # 15 * 0.6s = 9s 静音后自动停止
         accumulated_sentences = []  # 累积多个句子
         current_sentence = ""
+        last_transcribed_text = ""  # 记录上次转写的文本，避免重复
+        processed_buffer_size = 0  # 记录已处理的缓冲区大小
         
         # 主循环：收帧 → 累积 → 定时转写（partial）→ 智能完整性检测
         while True:
@@ -157,10 +159,10 @@ class StreamingASR:
 
             # 检查音频队列是否为空（超时处理）
             if audio_q.empty():
-                await asyncio.sleep(0.05)  # 减少延迟从0.1秒到0.05秒
+                await asyncio.sleep(0.1)  # 适当的延迟
                 silence_count += 1
                 # 如果长时间没有音频输入且有内容，自动结束
-                if silence_count > max_silence_chunks and len(self._buf) > 0:
+                if silence_count > max_silence_chunks and len(self._buf) > processed_buffer_size:
                     print("[ASR] Long silence detected, auto stopping")
                     break
                 continue
@@ -174,52 +176,58 @@ class StreamingASR:
                 continue
 
             # 定时做一次 partial 和智能完整性检测
-            if self._now_ms() - self._last_flush_ms >= CHUNK_MS and len(self._buf) >= BYTES_PER_MS * CHUNK_MS:
-                txt = await self._decode(bytes(self._buf))
-                if txt:
-                    # 检查是否是新的句子内容
-                    if txt != current_sentence:
-                        current_sentence = txt
+            if (self._now_ms() - self._last_flush_ms >= CHUNK_MS and 
+                len(self._buf) >= BYTES_PER_MS * CHUNK_MS and
+                len(self._buf) > processed_buffer_size):  # 确保有新的音频数据
+                
+                # 只处理新增的音频数据，避免重复处理
+                new_audio_data = bytes(self._buf[processed_buffer_size:])
+                if len(new_audio_data) >= BYTES_PER_MS * CHUNK_MS:
+                    txt = await self._decode(new_audio_data)
+                    
+                    if txt and txt != last_transcribed_text:  # 避免重复的转写结果
+                        last_transcribed_text = txt
                         
-                        # 只把新增的差量发出去，避免 "Hello." 重复
-                        delta = txt[len(self._last_partial):]
-                        if delta.strip():
-                            await send_partial(delta)
+                        # 检查是否是真正的新内容
+                        if txt != current_sentence and not txt in self._last_partial:
+                            current_sentence = txt
+                            
+                            # 发送新的部分结果
+                            await send_partial(txt)
                             self._last_partial = txt  # 保存完整文本供外部访问
-                    
-                    # 检查是否包含多个句子（通过句号、问号、感叹号分割）
-                    sentences = self._split_into_sentences(txt)
-                    
-                    # 如果检测到完整句子，但不立即停止录音，而是继续收集
-                    if len(sentences) > 1 or (len(sentences) == 1 and self._is_sentence_complete(sentences[0])):
-                        # 将完整的句子添加到累积列表
-                        for sentence in sentences[:-1]:  # 除了最后一个句子
-                            if sentence.strip() and sentence.strip() not in accumulated_sentences:
-                                accumulated_sentences.append(sentence.strip())
                         
-                        # 检查最后一个句子是否完整
-                        last_sentence = sentences[-1] if sentences else ""
-                        if last_sentence.strip() and self._is_sentence_complete(last_sentence):
-                            accumulated_sentences.append(last_sentence.strip())
+                        # 检查是否包含完整句子
+                        sentences = self._split_into_sentences(txt)
                         
-                        print(f"[ASR] Accumulated sentences: {accumulated_sentences}")
-                        
-                        # 只有在检测到明确的停顿或特定条件时才停止
-                        if (self._completion_check_count >= 2 and  # 至少检查2次
-                            len(accumulated_sentences) > 0 and
-                            silence_count > 3):  # 有一定的静音
+                        # 如果检测到完整句子
+                        if len(sentences) > 0 and self._is_sentence_complete(sentences[-1]):
+                            # 将新的完整句子添加到累积列表（避免重复）
+                            for sentence in sentences:
+                                clean_sentence = sentence.strip()
+                                if (clean_sentence and 
+                                    clean_sentence not in accumulated_sentences and
+                                    len(clean_sentence) > 3):  # 过滤太短的句子
+                                    accumulated_sentences.append(clean_sentence)
                             
-                            # 合并所有句子作为最终结果
-                            final_text = " ".join(accumulated_sentences)
-                            if last_sentence.strip() and not self._is_sentence_complete(last_sentence):
-                                final_text += " " + last_sentence.strip()
+                            print(f"[ASR] Accumulated sentences: {accumulated_sentences}")
                             
-                            print(f"[ASR] Sending combined sentences: '{final_text}'")
-                            await send_final(final_text)
-                            self._final_sent = True
-                            break
+                            # 检测到完整句子后，清理已处理的缓冲区
+                            processed_buffer_size = len(self._buf)
+                            
+                            # 如果有完整句子且有足够的静音，结束录音
+                            if (len(accumulated_sentences) > 0 and 
+                                silence_count > 5):  # 减少静音要求
+                                
+                                final_text = " ".join(accumulated_sentences)
+                                print(f"[ASR] Sending final text: '{final_text}'")
+                                await send_final(final_text)
+                                self._final_sent = True
+                                break
+                        
+                        self._completion_check_count += 1
                     
-                    self._completion_check_count += 1
+                    # 更新已处理的缓冲区大小
+                    processed_buffer_size = len(self._buf)
                     
                 self._last_flush_ms = self._now_ms()
 
@@ -322,6 +330,58 @@ class StreamingASR:
         rms = np.sqrt(np.mean(audio_data ** 2))
         return rms
 
+    def _is_likely_misrecognition(self, text: str) -> bool:
+        """
+        判断是否为误识别的文本
+        """
+        if not text or len(text.strip()) < 2:
+            return True
+        
+        # 常见的误识别词汇（扩展列表）
+        false_positives = {
+            "嗯", "啊", "呃", "额", "哦", "唉", "咦", "哎", "呀", "哟",
+            "嗯嗯", "啊啊", "呃呃", "额额", "哦哦", "唉唉", "咦咦", "哎哎", "呀呀", "哟哟",
+            "你好", "谢谢", "不客气", "再见", "拜拜", "好的", "是的", "没有", "不是",
+            "我", "你", "他", "她", "它", "我们", "你们", "他们", "她们", "它们",
+            "的", "了", "在", "是", "有", "和", "与", "或", "但", "而",
+            "一", "二", "三", "四", "五", "六", "七", "八", "九", "十",
+            ".", "。", "?", "？", "!", "！", ",", "，", ";", "；", ":", "：",
+            "hello", "hi", "bye", "ok", "yes", "no", "thank", "thanks",
+            "音乐", "播放", "暂停", "停止", "继续", "下一首", "上一首", "音量",
+            "静音", "取消静音", "重复", "循环", "随机", "列表", "专辑", "歌手",
+            "搜索", "查找", "添加", "删除", "收藏", "喜欢", "不喜欢", "评分"
+        }
+        
+        text_clean = text.strip().lower()
+        
+        # 检查是否为单个误识别词汇
+        if text_clean in false_positives:
+            return True
+        
+        # 检查是否为重复字符（如"啊啊啊啊"）
+        if len(set(text_clean)) <= 2 and len(text_clean) > 3:
+            return True
+        
+        # 检查是否为纯标点符号
+        if all(c in ".,!?;:。，！？；：" for c in text_clean):
+            return True
+        
+        # 检查是否为过短的无意义文本
+        if len(text_clean) <= 3 and not any(c.isalnum() for c in text_clean):
+            return True
+        
+        # 检查是否包含过多重复字符
+        char_counts = {}
+        for char in text_clean:
+            char_counts[char] = char_counts.get(char, 0) + 1
+        
+        # 如果某个字符出现次数超过文本长度的70%，认为是重复内容
+        for count in char_counts.values():
+            if count > len(text_clean) * 0.7:
+                return True
+        
+        return False
+
     async def _decode(self, pcm_bytes: bytes) -> str:
         """
         把 16kHz s16le PCM 包成 WAV 后，调用 OpenAI 转写。
@@ -338,11 +398,19 @@ class StreamingASR:
         
         # 计算音频能量，过滤掉静音或极低音量的音频
         audio_energy = self._calculate_audio_energy(pcm_bytes)
-        min_energy_threshold = 100.0  # 最小能量阈值，可根据实际情况调整
+        min_energy_threshold = 150.0  # 提高能量阈值，过滤更多静音
         
         if audio_energy < min_energy_threshold:
             print(f"[ASR] Audio energy too low ({audio_energy:.2f}), likely silence, skipping transcription")
             return ""
+        
+        # 检查音频变化，过滤重复内容
+        if hasattr(self, '_last_audio_energy'):
+            energy_diff = abs(audio_energy - self._last_audio_energy)
+            if energy_diff < 20:  # 如果音频能量变化很小，可能是重复内容
+                print(f"[ASR] Audio energy change too small ({energy_diff:.2f}), likely duplicate")
+                return ""
+        self._last_audio_energy = audio_energy
             
         wav_bytes = self._pcm_to_wav(pcm_bytes)
         bio = io.BytesIO(wav_bytes)
@@ -359,21 +427,17 @@ class StreamingASR:
             # 直接获取文本结果
             text = (resp or "").strip()
             
-            # 过滤掉常见的误识别结果
-            false_positive_patterns = [
-                "i am", "i'm", "um", "uh", "ah", "oh", "mm", "hmm",
-                ".", ",", "?", "!", " ", ""
-            ]
-            
-            # 检查是否为误识别的常见模式
-            if text.lower().strip() in false_positive_patterns:
-                print(f"[ASR] Filtered out likely false positive: '{text}'")
+            # 使用新的误识别检测方法
+            if self._is_likely_misrecognition(text):
+                print(f"[ASR] Filtered out likely misrecognition: '{text}'")
                 return ""
             
-            # 检查文本长度和内容质量
-            if len(text.strip()) < 3:  # 过短的结果很可能是误识别
-                print(f"[ASR] Text too short, likely false positive: '{text}'")
+            # 检查是否与上次结果重复
+            if hasattr(self, '_last_decoded_text') and text == self._last_decoded_text:
+                print(f"[ASR] Duplicate text detected: '{text}'")
                 return ""
+            
+            self._last_decoded_text = text
             
             # 记录转写结果用于调试
             if text:
