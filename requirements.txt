@@ -1,0 +1,17 @@
+fastapi
+uvicorn
+pydantic
+python-dotenv
+passlib[bcrypt]
+pyjwt
+tenacity
+dotenv
+httpx
+openai
+python-multipart
+websockets
+faster-whisper
+webrtcvad
+sounddevice
+numpy
+aiohttp

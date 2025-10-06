@@ -1,0 +1,40 @@
+# Virtual environments
+.venv/
+venv/
+ENV/
+env/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.pyd_d
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+
+# Environment & secrets
+.env
+.env.*
+!.env.example   # keep a safe template if you want
+
+# OS junk
+.DS_Store
+Thumbs.db
+
+# IDE settings
+.vscode/
+.idea/
+
+# Logs
+*.log
+
+# Coverage/testing
+.coverage
+htmlcov/
+.tox/
+.mypy_cache/
+.pytest_cache/
